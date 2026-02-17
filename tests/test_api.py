@@ -1,6 +1,9 @@
+from concurrent.futures import ThreadPoolExecutor
+
 from fastapi.testclient import TestClient
 
 from app.main import app, repository
+from app.models import PetCreate
 
 client = TestClient(app)
 
@@ -63,3 +66,35 @@ def test_validation_for_pet_type() -> None:
         },
     )
     assert response.status_code == 422
+
+
+def test_patch_rejects_null_required_field() -> None:
+    create = client.post(
+        '/pets',
+        json={
+            'name': 'Bella',
+            'pet_type': 'dog',
+            'age': 5,
+            'vaccinated': True,
+            'owner_name': 'Liam',
+        },
+    )
+    pet_id = create.json()['id']
+
+    patch = client.patch(f'/pets/{pet_id}', json={'name': None})
+    assert patch.status_code == 422
+
+    unchanged = client.get(f'/pets/{pet_id}')
+    assert unchanged.status_code == 200
+    assert unchanged.json()['name'] == 'Bella'
+
+
+def test_repository_create_assigns_unique_ids_under_concurrency() -> None:
+    payload = PetCreate(name='Nori', pet_type='cat', age=2, vaccinated=False, owner_name='Eve')
+
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        pets = list(executor.map(lambda _: repository.create(payload), range(50)))
+
+    ids = [pet.id for pet in pets]
+    assert len(ids) == len(set(ids))
+    assert len(repository._pets) == 50  # noqa: SLF001

@@ -2,6 +2,7 @@ from datetime import date
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+from pydantic import ValidationError
 
 from app.models import ErrorResponse, Pet, PetCreate, PetType, PetUpdate, ServiceInfo
 from app.repository import PetRepository
@@ -64,7 +65,10 @@ def get_pet(pet_id: int, repo: PetRepository = Depends(get_repository)) -> Pet:
     tags=["pets"],
 )
 def update_pet(pet_id: int, payload: PetUpdate, repo: PetRepository = Depends(get_repository)) -> Pet:
-    pet = repo.update(pet_id, payload)
+    try:
+        pet = repo.update(pet_id, payload)
+    except ValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
     if pet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pet not found")
     return pet
