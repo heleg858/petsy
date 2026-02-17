@@ -406,12 +406,14 @@ model Review {
 
 1. **Онлайн-запись**
    - Нельзя забронировать занятый слот.
+   - Проверка слота должна быть атомарной на уровне БД (транзакция + `SELECT ... FOR UPDATE`/advisory lock и `EXCLUDE`-ограничение на пересечение интервалов для активных статусов).
    - Проверка совместимости услуги и типа питомца.
    - Таймаут на оплату брони (например, 15 минут).
 
 2. **Отзывы**
    - Отзыв можно оставить только после завершённой записи.
    - Один booking → один отзыв.
+   - `review.serviceId` должен совпадать с `booking.serviceId` (ID услуги берётся из booking, а не из клиентского payload).
 
 3. **Консультации**
    - Сессия активируется только после успешной оплаты.
@@ -519,32 +521,46 @@ async createBooking(dto: {
   serviceId: string;
   startAt: Date;
 }) {
-  const service = await this.prisma.service.findUniqueOrThrow({ where: { id: dto.serviceId } });
-  const endAt = new Date(dto.startAt.getTime() + service.durationMin * 60 * 1000);
+  return this.prisma.$transaction(async (tx) => {
+    const service = await tx.service.findUniqueOrThrow({ where: { id: dto.serviceId } });
+    const endAt = new Date(dto.startAt.getTime() + service.durationMin * 60 * 1000);
 
-  const overlap = await this.prisma.booking.findFirst({
-    where: {
-      serviceId: dto.serviceId,
-      status: { in: ['PENDING', 'CONFIRMED'] },
-      AND: [{ startAt: { lt: endAt } }, { endAt: { gt: dto.startAt } }],
-    },
-  });
+    // Сериализуем бронирования по услуге и устраняем race-condition под нагрузкой.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${dto.serviceId}))`;
 
-  if (overlap) throw new Error('Slot is not available');
+    const overlap = await tx.booking.findFirst({
+      where: {
+        serviceId: dto.serviceId,
+        status: { in: ['PENDING', 'CONFIRMED'] },
+        AND: [{ startAt: { lt: endAt } }, { endAt: { gt: dto.startAt } }],
+      },
+    });
 
-  return this.prisma.booking.create({
-    data: {
-      userId: dto.userId,
-      petId: dto.petId,
-      serviceId: dto.serviceId,
-      type: service.type,
-      startAt: dto.startAt,
-      endAt,
-      totalCents: service.priceCents,
-      status: 'PENDING',
-    },
+    if (overlap) throw new Error('Slot is not available');
+
+    return tx.booking.create({
+      data: {
+        userId: dto.userId,
+        petId: dto.petId,
+        serviceId: dto.serviceId,
+        type: service.type,
+        startAt: dto.startAt,
+        endAt,
+        totalCents: service.priceCents,
+        status: 'PENDING',
+      },
+    });
   });
 }
+
+// Рекомендуемая DB-защита от двойного бронирования (PostgreSQL):
+// CREATE EXTENSION IF NOT EXISTS btree_gist;
+// ALTER TABLE "Booking"
+// ADD CONSTRAINT booking_no_overlap_active
+// EXCLUDE USING gist (
+//   "serviceId" WITH =,
+//   tstzrange("startAt", "endAt", '[)') WITH &&
+// ) WHERE ("status" IN ('PENDING', 'CONFIRMED'));
 ```
 
 ## 11.4 Отзывы
@@ -554,6 +570,7 @@ async createReview(userId: string, dto: { bookingId: string; serviceId: string; 
   const booking = await this.prisma.booking.findUniqueOrThrow({ where: { id: dto.bookingId } });
   if (booking.userId !== userId) throw new Error('Forbidden');
   if (booking.status !== 'COMPLETED') throw new Error('Booking not completed');
+  if (booking.serviceId !== dto.serviceId) throw new Error('Service mismatch for booking');
 
   const exists = await this.prisma.review.findFirst({ where: { bookingId: dto.bookingId } });
   if (exists) throw new Error('Review already exists');
@@ -562,7 +579,7 @@ async createReview(userId: string, dto: { bookingId: string; serviceId: string; 
     data: {
       userId,
       bookingId: dto.bookingId,
-      serviceId: dto.serviceId,
+      serviceId: booking.serviceId,
       rating: dto.rating,
       comment: dto.comment,
     },
